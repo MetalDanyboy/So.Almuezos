@@ -40,6 +40,8 @@ const GOOGLE_FIELD_MASK = [
   "places.businessStatus",
   "places.googleMapsUri",
   "places.nationalPhoneNumber",
+  "places.rating",
+  "places.userRatingCount",
   "places.websiteUri",
 ].join(",");
 const OVERPASS_URLS = [
@@ -622,6 +624,8 @@ function normalizeGooglePlace(place, origin) {
     address,
     mapsQuery: place.googleMapsUri || buildMapsQuery(name, address, lat, lon),
     quality: googlePlaceQualityScore(place, address),
+    rating: Number(place.rating),
+    userRatingCount: Number(place.userRatingCount),
     tags: {
       amenity: primaryType,
       cuisine,
@@ -648,6 +652,8 @@ function googlePlaceQualityScore(place, address) {
   if (place.nationalPhoneNumber) score += 2;
   if (place.websiteUri) score += 2;
   if (place.googleMapsUri) score += 2;
+  if (Number.isFinite(Number(place.rating))) score += Math.max(-3, Math.min(6, (Number(place.rating) - 3.5) * 2.6));
+  if (Number.isFinite(Number(place.userRatingCount))) score += Math.min(4, Math.log10(Number(place.userRatingCount) + 1));
   if (place.businessStatus === "OPERATIONAL") score += 3;
   if (place.businessStatus && place.businessStatus !== "OPERATIONAL") score -= 20;
   return score;

@@ -669,9 +669,10 @@ class LunchOracle extends HTMLElement {
           ${renderGenie("happy")}
           <div class="bubble result">
             <div class="result-head">
-              <div class="winner">
+            <div class="winner">
               <div>
                 <h2>${escapeHtml(rec.name)}</h2>
+                ${ratingLine(rec)}
                 <p>${escapeHtml(rec.kind)} a ${formatDistance(rec.distance)}. ${escapeHtml(reason)}</p>
               </div>
               <div class="score">${rec.score}%</div>
@@ -748,6 +749,7 @@ class LunchOracle extends HTMLElement {
     return `
       <a class="place" href="${escapeHtml(mapsUrl)}" target="_blank" rel="noreferrer" aria-label="Ver ubicacion de ${escapeHtml(place.name)}">
         <h4>${escapeHtml(place.name)}</h4>
+        ${ratingLine(place)}
         <div class="tiny">${escapeHtml(place.kind)} · ${formatDistance(place.distance)}</div>
         ${place.address ? `<div class="tiny">${escapeHtml(place.address)}</div>` : ""}
         <div class="tags">${tags.map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join("")}</div>
@@ -1682,6 +1684,8 @@ function recommendationSummary(place, rawScore) {
     lon: place.lon,
     address: place.address,
     mapsQuery: place.mapsQuery,
+    rating: place.rating,
+    userRatingCount: place.userRatingCount,
     score: Math.max(62, Math.min(99, Math.round(rawScore))),
   };
 }
@@ -1739,12 +1743,22 @@ function scorePlace(place, answers, maxWalk, delivery) {
   if (answers.risk === "oracle") score += seededNumber(`${seed}-oracle`) * 12;
   if (answers.mood === "random") score += seededNumber(`${seed}-random`) * 18;
   score += Math.max(-4, Math.min(8, Number(place.quality) || 0));
+  score += ratingScore(place);
 
   score += Math.max(0, 12 - place.distance / 250);
   if (!reason.length) reason.push("No es perfecto, pero el hambre aprobo la mocion.");
   if (delivery && deliveryScore(place) > 0) reason.push("Tiene senales de delivery o retiro.");
+  if (Number(place.rating) >= 4.4 && Number(place.userRatingCount) >= 20) reason.push("Tiene buena valoracion en Google.");
 
   return { place, rawScore: score, reason };
+}
+
+function ratingScore(place) {
+  const rating = Number(place.rating);
+  if (!Number.isFinite(rating)) return 0;
+  const count = Math.max(0, Number(place.userRatingCount) || 0);
+  const confidence = Math.min(1, Math.log10(count + 1) / 2);
+  return (rating - 3.7) * 12 * confidence;
 }
 
 function deliveryScore(place) {
@@ -1763,6 +1777,18 @@ function badgesFor(place, answers = {}) {
   if (String(place.tags.takeaway || "").toLowerCase() === "yes") badges.push("Retiro");
   if (!badges.length) badges.push(place.kind);
   return [...new Set(badges)].slice(0, 5);
+}
+
+function ratingLine(place) {
+  const rating = Number(place.rating);
+  if (!Number.isFinite(rating) || rating <= 0) return "";
+  const count = Number(place.userRatingCount);
+  const reviewText = Number.isFinite(count) && count > 0 ? ` · ${formatCount(count)} resenas` : "";
+  return `<div class="rating-line"><span class="rating-dot" aria-hidden="true"></span><b>${rating.toFixed(1)}</b><span>estrellas${reviewText}</span></div>`;
+}
+
+function formatCount(value) {
+  return new Intl.NumberFormat("es-CL", { maximumFractionDigits: 0 }).format(value);
 }
 
 function wantsDelivery(answers) {

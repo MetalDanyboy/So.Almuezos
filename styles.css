@@ -1018,6 +1018,29 @@ button {
   font-size: 0.98rem;
 }
 
+.rating-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 22px;
+  margin-bottom: 5px;
+  color: #6b4b00;
+  font-size: 0.82rem;
+  font-weight: 800;
+}
+
+.rating-line b {
+  color: #1b1f23;
+}
+
+.rating-dot {
+  width: 14px;
+  aspect-ratio: 1;
+  display: inline-block;
+  background: #f4b400;
+  clip-path: polygon(50% 0, 61% 34%, 98% 35%, 68% 56%, 79% 91%, 50% 70%, 21% 91%, 32% 56%, 2% 35%, 39% 34%);
+}
+
 .tags {
   display: flex;
   flex-wrap: wrap;
