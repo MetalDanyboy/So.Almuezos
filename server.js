@@ -5,11 +5,32 @@ const path = require("node:path");
 const os = require("node:os");
 
 const root = __dirname;
+loadEnvFile(path.join(root, ".env"));
 const port = Number(process.env.PORT || 5173);
 const sessions = new Map();
 const SESSION_MAX_AGE_MS = 30 * 60 * 1000;
 const SESSION_IDLE_MS = 10 * 60 * 1000;
 const SESSION_CLEANUP_MS = 60 * 1000;
+const PLACES_PROVIDER = String(process.env.PLACES_PROVIDER || "google").toLowerCase();
+const GOOGLE_PLACES_URL = "https://places.googleapis.com/v1/places:searchNearby";
+const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY || process.env.GOOGLE_MAPS_API_KEY || "";
+const GOOGLE_PLACES_FREE_CAP = positiveInteger(process.env.GOOGLE_PLACES_FREE_CAP, 5000);
+const GOOGLE_PLACES_SAFETY_BUFFER = Math.max(0, positiveInteger(process.env.GOOGLE_PLACES_SAFETY_BUFFER, 100));
+const GOOGLE_PLACES_MONTHLY_LIMIT = Math.max(0, positiveInteger(process.env.GOOGLE_PLACES_MONTHLY_LIMIT, GOOGLE_PLACES_FREE_CAP - GOOGLE_PLACES_SAFETY_BUFFER));
+const GOOGLE_PLACES_USAGE_FILE = process.env.GOOGLE_PLACES_USAGE_FILE || path.join(root, ".quota", "google-places-usage.json");
+const GOOGLE_PLACE_TYPES = ["restaurant", "cafe", "bar", "meal_takeaway", "meal_delivery"];
+const GOOGLE_FIELD_MASK = [
+  "places.id",
+  "places.displayName",
+  "places.formattedAddress",
+  "places.location",
+  "places.types",
+  "places.primaryType",
+  "places.businessStatus",
+  "places.googleMapsUri",
+  "places.nationalPhoneNumber",
+  "places.websiteUri",
+].join(",");
 const OVERPASS_URLS = [
   "https://overpass-api.de/api/interpreter",
   "https://overpass.kumi.systems/api/interpreter",
@@ -35,6 +56,8 @@ const categoryLabels = {
   food_court: "Patio de comida",
   pub: "Pub",
   bar: "Bar",
+  meal_takeaway: "Para llevar",
+  meal_delivery: "Delivery",
 };
 
 const server = http.createServer(async (req, res) => {
@@ -141,9 +164,17 @@ async function handleApi(req, res, url) {
       const coords = parseCoords(url);
       const radius = Math.max(500, Math.min(5000, Number(url.searchParams.get("radius")) || 3000));
       const places = await fetchNearbyPlaces(coords, radius);
-      sendJson(res, 200, { places, source: "openstreetmap-overpass" });
+      sendJson(res, 200, { places, source: placesSource() });
     } catch (error) {
-      sendJson(res, 502, { error: error.message || "No se pudieron obtener locales cercanos" });
+      if (error.quotaBlocked) {
+        sendJson(res, 429, {
+          error: error.message || "Se pauso la busqueda de locales por limite de cuota",
+          quotaBlocked: true,
+          quota: error.quota,
+        });
+      } else {
+        sendJson(res, 502, { error: error.message || "No se pudieron obtener locales cercanos" });
+      }
     }
     return;
   }
@@ -387,6 +418,30 @@ function networkAddresses() {
     .map((item) => item.address);
 }
 
+function loadEnvFile(filePath) {
+  if (!fs.existsSync(filePath)) return;
+  const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (!match || process.env[match[1]] !== undefined) continue;
+    process.env[match[1]] = unquoteEnvValue(match[2].trim());
+  }
+}
+
+function unquoteEnvValue(value) {
+  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+    return value.slice(1, -1);
+  }
+  return value;
+}
+
+function positiveInteger(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
 async function lookupIpLocation() {
   const primary = await getJson("https://ipapi.co/json/").catch(() => null);
   if (primary?.latitude && primary?.longitude) {
@@ -480,6 +535,182 @@ async function reverseGeocode(coords) {
 }
 
 async function fetchNearbyPlaces(coords, radius) {
+  if (PLACES_PROVIDER === "google") return fetchGooglePlaces(coords, radius);
+  if (PLACES_PROVIDER === "overpass") return fetchOverpassPlaces(coords, radius);
+  if (GOOGLE_PLACES_API_KEY) {
+    try {
+      return await fetchGooglePlaces(coords, radius);
+    } catch (error) {
+      if (error.quotaBlocked) throw error;
+      console.warn(`Google Places fallo; usando Overpass: ${error.message}`);
+    }
+  }
+  return fetchOverpassPlaces(coords, radius);
+}
+
+function placesSource() {
+  if (PLACES_PROVIDER === "google") return "google-places";
+  if (PLACES_PROVIDER === "overpass") return "openstreetmap-overpass";
+  return GOOGLE_PLACES_API_KEY ? "google-places-with-overpass-fallback" : "openstreetmap-overpass";
+}
+
+async function fetchGooglePlaces(coords, radius) {
+  if (!GOOGLE_PLACES_API_KEY) {
+    throw new Error("Falta configurar GOOGLE_PLACES_API_KEY en variables de entorno");
+  }
+
+  ensureGooglePlacesQuotaAvailable();
+  const data = await postJson(GOOGLE_PLACES_URL, {
+    includedTypes: GOOGLE_PLACE_TYPES,
+    maxResultCount: 20,
+    rankPreference: "DISTANCE",
+    languageCode: "es-419",
+    locationRestriction: {
+      circle: {
+        center: {
+          latitude: coords.lat,
+          longitude: coords.lon,
+        },
+        radius,
+      },
+    },
+  }, {
+    "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+    "X-Goog-FieldMask": GOOGLE_FIELD_MASK,
+  });
+  recordGooglePlacesUsage(1);
+  return (data.places || [])
+    .map((place) => normalizeGooglePlace(place, coords))
+    .filter((place) => place.name && Number.isFinite(place.distance))
+    .filter(uniquePlace())
+    .sort((a, b) => placeSortScore(a) - placeSortScore(b))
+    .slice(0, 50);
+}
+
+function normalizeGooglePlace(place, origin) {
+  const lat = Number(place.location?.latitude);
+  const lon = Number(place.location?.longitude);
+  const types = Array.isArray(place.types) ? place.types : [];
+  const primaryType = place.primaryType || types[0] || "restaurant";
+  const name = place.displayName?.text || "";
+  const cuisine = googleCuisineFromTypes(types);
+  const address = place.formattedAddress || "";
+  return {
+    id: `google-${place.id}`,
+    name,
+    cuisine,
+    kind: humanizeCuisine(cuisine) || categoryLabels[primaryType] || categoryLabels[types[0]] || "Local",
+    distance: haversine(origin.lat, origin.lon, lat, lon),
+    lat,
+    lon,
+    address,
+    mapsQuery: place.googleMapsUri || buildMapsQuery(name, address, lat, lon),
+    quality: googlePlaceQualityScore(place, address),
+    tags: {
+      amenity: primaryType,
+      cuisine,
+      delivery: types.includes("meal_delivery") ? "yes" : undefined,
+      takeaway: types.includes("meal_takeaway") ? "yes" : undefined,
+      address,
+      phone: place.nationalPhoneNumber,
+      website: place.websiteUri,
+      business_status: place.businessStatus,
+      source: "google-places",
+    },
+  };
+}
+
+function googleCuisineFromTypes(types) {
+  const type = types.find((item) => /restaurant|cafe|bar|meal_takeaway|meal_delivery/i.test(item)) || types[0] || "";
+  return type.replace(/_restaurant$/i, "").replace(/^meal_/i, "meal_");
+}
+
+function googlePlaceQualityScore(place, address) {
+  let score = 8;
+  if (place.displayName?.text) score += 6;
+  if (address) score += 5;
+  if (place.nationalPhoneNumber) score += 2;
+  if (place.websiteUri) score += 2;
+  if (place.googleMapsUri) score += 2;
+  if (place.businessStatus === "OPERATIONAL") score += 3;
+  if (place.businessStatus && place.businessStatus !== "OPERATIONAL") score -= 20;
+  return score;
+}
+
+function ensureGooglePlacesQuotaAvailable() {
+  const quota = googlePlacesQuota();
+  if (quota.used >= quota.monthlyLimit) {
+    const error = new Error(
+      `Se pauso la busqueda con Google Places porque ya se usaron ${quota.used}/${quota.freeCap} consultas protegidas este mes. Vuelve a intentar en ${quota.resetsIn}.`,
+    );
+    error.quotaBlocked = true;
+    error.quota = quota;
+    throw error;
+  }
+}
+
+function recordGooglePlacesUsage(amount) {
+  const state = readGooglePlacesUsage();
+  state.used += amount;
+  writeGooglePlacesUsage(state);
+}
+
+function googlePlacesQuota() {
+  const state = readGooglePlacesUsage();
+  return {
+    provider: "google-places",
+    month: state.month,
+    used: state.used,
+    remainingProtected: Math.max(0, GOOGLE_PLACES_MONTHLY_LIMIT - state.used),
+    freeCap: GOOGLE_PLACES_FREE_CAP,
+    safetyBuffer: GOOGLE_PLACES_SAFETY_BUFFER,
+    monthlyLimit: GOOGLE_PLACES_MONTHLY_LIMIT,
+    resetAt: nextQuotaReset().toISOString(),
+    resetsIn: formatDuration(nextQuotaReset().getTime() - Date.now()),
+  };
+}
+
+function readGooglePlacesUsage() {
+  const month = currentQuotaMonth();
+  try {
+    const data = JSON.parse(fs.readFileSync(GOOGLE_PLACES_USAGE_FILE, "utf8"));
+    if (data.month === month && Number.isFinite(Number(data.used))) {
+      return { month, used: Math.max(0, Math.floor(Number(data.used))) };
+    }
+  } catch {
+    // Missing or unreadable quota files start a fresh protected counter.
+  }
+  return { month, used: 0 };
+}
+
+function writeGooglePlacesUsage(state) {
+  fs.mkdirSync(path.dirname(GOOGLE_PLACES_USAGE_FILE), { recursive: true });
+  fs.writeFileSync(GOOGLE_PLACES_USAGE_FILE, JSON.stringify(state, null, 2));
+}
+
+function currentQuotaMonth() {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function nextQuotaReset() {
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth() + 1, 1, 0, 0, 0, 0);
+}
+
+function formatDuration(ms) {
+  const totalMinutes = Math.max(1, Math.ceil(ms / 60000));
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  const parts = [];
+  if (days) parts.push(`${days} dia${days === 1 ? "" : "s"}`);
+  if (hours) parts.push(`${hours} hora${hours === 1 ? "" : "s"}`);
+  if (!days && minutes) parts.push(`${minutes} minuto${minutes === 1 ? "" : "s"}`);
+  return parts.join(", ") || "menos de 1 minuto";
+}
+
+async function fetchOverpassPlaces(coords, radius) {
   const query = `
     [out:json][timeout:18];
     (
@@ -668,6 +899,60 @@ function getJson(target) {
     });
     request.on("error", reject);
   });
+}
+
+function postJson(target, payload, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify(payload || {});
+    const url = new URL(target);
+    const request = https.request(
+      {
+        hostname: url.hostname,
+        path: `${url.pathname}${url.search}`,
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json; charset=UTF-8",
+          "Content-Length": Buffer.byteLength(body),
+          "User-Agent": USER_AGENT,
+          ...headers,
+        },
+        timeout: 20000,
+      },
+      (response) => {
+        let responseBody = "";
+        response.on("data", (chunk) => {
+          responseBody += chunk;
+        });
+        response.on("end", () => {
+          if (response.statusCode < 200 || response.statusCode >= 300) {
+            reject(new Error(parseRemoteError(responseBody) || `HTTP ${response.statusCode}`));
+            return;
+          }
+          try {
+            resolve(JSON.parse(responseBody));
+          } catch {
+            reject(new Error("Respuesta invalida"));
+          }
+        });
+      },
+    );
+    request.on("timeout", () => {
+      request.destroy(new Error("Timeout"));
+    });
+    request.on("error", reject);
+    request.write(body);
+    request.end();
+  });
+}
+
+function parseRemoteError(body) {
+  try {
+    const data = JSON.parse(body);
+    return data.error?.message || data.error || "";
+  } catch {
+    return "";
+  }
 }
 
 async function postFormJsonWithFallback(targets, form) {

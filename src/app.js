@@ -1227,10 +1227,24 @@ class LunchOracle extends HTMLElement {
         sessionReady: Boolean(this.state.sessionId),
         message: this.state.sessionId
           ? "Ubicacion lista. Cuando esten todos, apreta iniciar preguntas."
-          : places.length ? "" : "No encontre locales en OpenStreetMap cerca de ahi; usare respaldo.",
+          : places.length ? "" : "No encontre locales reales cerca de ahi; usare respaldo.",
       });
       await this.publishSetup(coords, usablePlaces, sessionQuestions, !places.length);
     } catch (error) {
+      if (error.quotaBlocked) {
+        const quota = error.quota || {};
+        this.setState({
+          coords,
+          places: [],
+          addressSuggestions: [],
+          addressSuggesting: false,
+          loading: false,
+          usedFallback: false,
+          sessionReady: false,
+          message: `${error.message} Quedan ${quota.remainingProtected ?? 0} consultas protegidas y el contador se reinicia en ${quota.resetsIn || "el proximo mes"}.`,
+        });
+        return;
+      }
       const sessionQuestions = pickQuestions();
       this.setState({
         coords,
@@ -1928,6 +1942,8 @@ async function parseApiResponse(response) {
     const error = new Error(data.error || "Error de servidor");
     error.status = response.status;
     error.expired = Boolean(data.expired) || response.status === 410;
+    error.quotaBlocked = Boolean(data.quotaBlocked) || response.status === 429;
+    error.quota = data.quota || null;
     throw error;
   }
   return data;
