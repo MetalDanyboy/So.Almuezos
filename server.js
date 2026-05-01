@@ -18,6 +18,10 @@ const GOOGLE_PLACES_FREE_CAP = positiveInteger(process.env.GOOGLE_PLACES_FREE_CA
 const GOOGLE_PLACES_SAFETY_BUFFER = Math.max(0, positiveInteger(process.env.GOOGLE_PLACES_SAFETY_BUFFER, 100));
 const GOOGLE_PLACES_MONTHLY_LIMIT = Math.max(0, positiveInteger(process.env.GOOGLE_PLACES_MONTHLY_LIMIT, GOOGLE_PLACES_FREE_CAP - GOOGLE_PLACES_SAFETY_BUFFER));
 const GOOGLE_PLACES_USAGE_FILE = process.env.GOOGLE_PLACES_USAGE_FILE || path.join(root, ".quota", "google-places-usage.json");
+const UPSTASH_REDIS_REST_URL = String(process.env.UPSTASH_REDIS_REST_URL || "").replace(/\/+$/, "");
+const UPSTASH_REDIS_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
+const HAS_UPSTASH_QUOTA = Boolean(UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN);
+const HAS_PARTIAL_UPSTASH_QUOTA = Boolean(UPSTASH_REDIS_REST_URL || UPSTASH_REDIS_REST_TOKEN) && !HAS_UPSTASH_QUOTA;
 const GOOGLE_PLACE_TYPES = ["restaurant", "cafe", "bar", "meal_takeaway", "meal_delivery"];
 const GOOGLE_FIELD_MASK = [
   "places.id",
@@ -559,7 +563,8 @@ async function fetchGooglePlaces(coords, radius) {
     throw new Error("Falta configurar GOOGLE_PLACES_API_KEY en variables de entorno");
   }
 
-  ensureGooglePlacesQuotaAvailable();
+  await ensureGooglePlacesQuotaAvailable();
+  await recordGooglePlacesUsage(1);
   const data = await postJson(GOOGLE_PLACES_URL, {
     includedTypes: GOOGLE_PLACE_TYPES,
     maxResultCount: 20,
@@ -578,7 +583,6 @@ async function fetchGooglePlaces(coords, radius) {
     "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
     "X-Goog-FieldMask": GOOGLE_FIELD_MASK,
   });
-  recordGooglePlacesUsage(1);
   return (data.places || [])
     .map((place) => normalizeGooglePlace(place, coords))
     .filter((place) => place.name && Number.isFinite(place.distance))
@@ -637,8 +641,8 @@ function googlePlaceQualityScore(place, address) {
   return score;
 }
 
-function ensureGooglePlacesQuotaAvailable() {
-  const quota = googlePlacesQuota();
+async function ensureGooglePlacesQuotaAvailable() {
+  const quota = await googlePlacesQuota();
   if (quota.used >= quota.monthlyLimit) {
     const error = new Error(
       `Se pauso la busqueda con Google Places porque ya se usaron ${quota.used}/${quota.freeCap} consultas protegidas este mes. Vuelve a intentar en ${quota.resetsIn}.`,
@@ -649,16 +653,23 @@ function ensureGooglePlacesQuotaAvailable() {
   }
 }
 
-function recordGooglePlacesUsage(amount) {
-  const state = readGooglePlacesUsage();
+async function recordGooglePlacesUsage(amount) {
+  if (HAS_PARTIAL_UPSTASH_QUOTA) throw quotaStorageError(new Error("faltan variables UPSTASH_REDIS_REST_URL o UPSTASH_REDIS_REST_TOKEN"));
+  if (HAS_UPSTASH_QUOTA) {
+    await recordGooglePlacesUsageInUpstash(amount);
+    return;
+  }
+  const state = readGooglePlacesUsageFromFile();
   state.used += amount;
-  writeGooglePlacesUsage(state);
+  writeGooglePlacesUsageToFile(state);
 }
 
-function googlePlacesQuota() {
-  const state = readGooglePlacesUsage();
+async function googlePlacesQuota() {
+  if (HAS_PARTIAL_UPSTASH_QUOTA) throw quotaStorageError(new Error("faltan variables UPSTASH_REDIS_REST_URL o UPSTASH_REDIS_REST_TOKEN"));
+  const state = HAS_UPSTASH_QUOTA ? await readGooglePlacesUsageFromUpstash() : readGooglePlacesUsageFromFile();
   return {
     provider: "google-places",
+    storage: HAS_UPSTASH_QUOTA ? "upstash" : "local-file",
     month: state.month,
     used: state.used,
     remainingProtected: Math.max(0, GOOGLE_PLACES_MONTHLY_LIMIT - state.used),
@@ -670,7 +681,48 @@ function googlePlacesQuota() {
   };
 }
 
-function readGooglePlacesUsage() {
+async function readGooglePlacesUsageFromUpstash() {
+  try {
+    const result = await upstashCommand(["GET", googlePlacesUsageKey()]);
+    return { month: currentQuotaMonth(), used: Math.max(0, Math.floor(Number(result) || 0)) };
+  } catch (error) {
+    throw quotaStorageError(error);
+  }
+}
+
+async function recordGooglePlacesUsageInUpstash(amount) {
+  try {
+    await upstashCommand(["INCRBY", googlePlacesUsageKey(), String(amount)]);
+    await upstashCommand(["EXPIREAT", googlePlacesUsageKey(), String(Math.floor(nextQuotaReset().getTime() / 1000))]);
+  } catch (error) {
+    throw quotaStorageError(error);
+  }
+}
+
+function quotaStorageError(error) {
+  const quota = {
+    provider: "google-places",
+    storage: "upstash",
+    month: currentQuotaMonth(),
+    used: 0,
+    remainingProtected: 0,
+    freeCap: GOOGLE_PLACES_FREE_CAP,
+    safetyBuffer: GOOGLE_PLACES_SAFETY_BUFFER,
+    monthlyLimit: GOOGLE_PLACES_MONTHLY_LIMIT,
+    resetAt: nextQuotaReset().toISOString(),
+    resetsIn: formatDuration(nextQuotaReset().getTime() - Date.now()),
+  };
+  const blocked = new Error(`No pude verificar la cuota persistente en Upstash (${error.message}). La busqueda queda pausada para evitar cobros accidentales.`);
+  blocked.quotaBlocked = true;
+  blocked.quota = quota;
+  return blocked;
+}
+
+function googlePlacesUsageKey() {
+  return `google_places_usage:${currentQuotaMonth()}`;
+}
+
+function readGooglePlacesUsageFromFile() {
   const month = currentQuotaMonth();
   try {
     const data = JSON.parse(fs.readFileSync(GOOGLE_PLACES_USAGE_FILE, "utf8"));
@@ -683,7 +735,7 @@ function readGooglePlacesUsage() {
   return { month, used: 0 };
 }
 
-function writeGooglePlacesUsage(state) {
+function writeGooglePlacesUsageToFile(state) {
   fs.mkdirSync(path.dirname(GOOGLE_PLACES_USAGE_FILE), { recursive: true });
   fs.writeFileSync(GOOGLE_PLACES_USAGE_FILE, JSON.stringify(state, null, 2));
 }
@@ -944,6 +996,14 @@ function postJson(target, payload, headers = {}) {
     request.write(body);
     request.end();
   });
+}
+
+async function upstashCommand(command) {
+  const response = await postJson(UPSTASH_REDIS_REST_URL, command, {
+    Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}`,
+  });
+  if (response.error) throw new Error(response.error);
+  return response.result;
 }
 
 function parseRemoteError(body) {

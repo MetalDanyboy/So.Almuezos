@@ -20,12 +20,18 @@ Para desarrollo local, copia `.env.example` a `.env` y completa:
 - `GOOGLE_PLACES_FREE_CAP`: tope gratis mensual que quieres proteger.
 - `GOOGLE_PLACES_SAFETY_BUFFER`: margen de seguridad antes del tope gratis.
 - `GOOGLE_PLACES_MONTHLY_LIMIT`: limite maximo de consultas que la app permitira en el mes.
+- `UPSTASH_REDIS_REST_URL`: URL REST de tu base Redis en Upstash, recomendada para Render.
+- `UPSTASH_REDIS_REST_TOKEN`: token REST de Upstash.
 
 En Render, define esas mismas variables en **Environment**. No pegues la clave en ningun archivo versionado.
 
 ## Proteccion de cuota Google Places
 
-Cada busqueda de locales consume una consulta protegida por el contador local de la app. Cuando llega a `GOOGLE_PLACES_MONTHLY_LIMIT`, el endpoint `/api/places` responde `429` y la interfaz bloquea la busqueda, indicando cuanto falta para el reinicio mensual. El contador vive por defecto en `.quota/google-places-usage.json`, archivo ignorado por git.
+Cada busqueda de locales consume una consulta protegida por el contador mensual de la app. Cuando llega a `GOOGLE_PLACES_MONTHLY_LIMIT`, el endpoint `/api/places` responde `429` y la interfaz bloquea la busqueda, indicando cuanto falta para el reinicio mensual.
+
+En produccion usa Upstash Redis para que el contador sobreviva reinicios y redeploys de Render. Si `UPSTASH_REDIS_REST_URL` y `UPSTASH_REDIS_REST_TOKEN` existen, la app guarda el uso en una clave mensual como `google_places_usage:2026-05` y le asigna expiracion automatica al inicio del mes siguiente. Si Upstash esta configurado pero no responde, la app bloquea la busqueda para evitar cobros accidentales.
+
+Si no configuras Upstash, el contador cae a `.quota/google-places-usage.json`, que sirve para desarrollo local pero no es persistente en Render Free.
 
 ## Pasos
 
