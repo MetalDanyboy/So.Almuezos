@@ -494,8 +494,12 @@ async function fetchNearbyPlaces(coords, radius) {
     .map((element) => normalizePlace(element, coords))
     .filter((place) => place.name && Number.isFinite(place.distance))
     .filter(uniquePlace())
-    .sort((a, b) => a.distance - b.distance)
+    .sort((a, b) => placeSortScore(a) - placeSortScore(b))
     .slice(0, 50);
+}
+
+function placeSortScore(place) {
+  return place.distance - Math.max(-8, Math.min(18, Number(place.quality) || 0)) * 35;
 }
 
 function normalizePlace(element, origin) {
@@ -504,24 +508,86 @@ function normalizePlace(element, origin) {
   const lon = Number(element.lon ?? element.center?.lon);
   const amenity = tags.amenity || "restaurant";
   const cuisine = String(tags.cuisine || "").toLowerCase();
+  const name = tags.name || tags.brand || tags.operator || "";
+  const address = buildPlaceAddress(tags);
+  const quality = placeQualityScore(tags, name, address, element.type);
   return {
     id: `${element.type}-${element.id}`,
-    name: tags.name || tags.brand || "",
+    name,
     cuisine,
     kind: humanizeCuisine(cuisine) || categoryLabels[amenity] || "Local",
     distance: haversine(origin.lat, origin.lon, lat, lon),
     lat,
     lon,
+    address,
+    mapsQuery: buildMapsQuery(name, address, lat, lon),
+    quality,
     tags: {
       amenity,
       cuisine,
+      brand: tags.brand,
+      operator: tags.operator,
       delivery: tags.delivery,
       takeaway: tags.takeaway,
+      address,
       opening_hours: tags.opening_hours,
       phone: tags.phone || tags["contact:phone"],
       website: tags.website || tags["contact:website"],
     },
   };
+}
+
+function buildPlaceAddress(tags) {
+  const full = tags["addr:full"];
+  if (full) return full;
+  const street = [tags["addr:street"], tags["addr:housenumber"]].filter(Boolean).join(" ");
+  const locality = tags["addr:suburb"] || tags["addr:city"] || tags["addr:district"] || tags["addr:municipality"] || "";
+  const region = tags["addr:province"] || tags["addr:state"] || "";
+  const country = tags["addr:country"] || "";
+  return [street, locality, region, country].filter(Boolean).join(", ");
+}
+
+function buildMapsQuery(name, address, lat, lon) {
+  const parts = [name, address].filter(Boolean);
+  if (parts.length) {
+    const near = Number.isFinite(lat) && Number.isFinite(lon) ? ` cerca de ${lat.toFixed(6)},${lon.toFixed(6)}` : "";
+    return `${parts.join(", ")}${near}`;
+  }
+  return Number.isFinite(lat) && Number.isFinite(lon) ? `${lat},${lon}` : "";
+}
+
+function placeQualityScore(tags, name, address, elementType) {
+  let score = 0;
+  if (name) score += 6;
+  if (tags.brand) score += 2;
+  if (address) score += 5;
+  if (tags.phone || tags["contact:phone"]) score += 2;
+  if (tags.website || tags["contact:website"]) score += 2;
+  if (tags.opening_hours) score += 1;
+  if (elementType === "node") score += 1;
+  if (isGenericFoodName(name)) score -= 7;
+  return score;
+}
+
+function isGenericFoodName(name) {
+  const normalized = String(name || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
+    .trim();
+  return new Set([
+    "sandwiches",
+    "hamburguesas",
+    "hot dogs",
+    "completos",
+    "pizza",
+    "sushi",
+    "restaurant",
+    "restaurante",
+    "cafeteria",
+    "cafe",
+    "delivery",
+  ]).has(normalized);
 }
 
 function parseCoords(url) {

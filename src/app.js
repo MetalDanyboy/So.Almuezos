@@ -336,7 +336,7 @@ class LunchOracle extends HTMLElement {
           <input class="input" readonly value="${escapeHtml(this.state.shareUrl)}" />
           <button class="secondary" data-action="copy-link">Copiar</button>
         </div>
-        <p>Para celulares, abre este link usando la IP de red local del computador anfitrion.</p>
+        <p>Comparte este link con quienes van a votar el almuerzo.</p>
       </div>
     `;
   }
@@ -748,6 +748,7 @@ class LunchOracle extends HTMLElement {
       <article class="place">
         <h4>${escapeHtml(place.name)}</h4>
         <div class="tiny">${escapeHtml(place.kind)} · ${formatDistance(place.distance)}</div>
+        ${place.address ? `<div class="tiny">${escapeHtml(place.address)}</div>` : ""}
         <div class="tags">${tags.map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join("")}</div>
       </article>
     `;
@@ -1506,7 +1507,7 @@ async function geolocationAvailability() {
     return {
       ok: false,
       message:
-        "El navegador bloqueo la geolocalizacion porque esta pagina no esta en HTTPS. En este computador usa http://127.0.0.1:5173/; desde celulares en la red local escribe la direccion manualmente o sirve la app con HTTPS.",
+        "El navegador bloqueo la geolocalizacion porque la pagina no esta en HTTPS. Usa una direccion manual o abre la version publicada con HTTPS.",
     };
   }
 
@@ -1662,6 +1663,10 @@ function recommendationSummary(place, rawScore) {
     name: place.name,
     kind: place.kind,
     distance: place.distance,
+    lat: place.lat,
+    lon: place.lon,
+    address: place.address,
+    mapsQuery: place.mapsQuery,
     score: Math.max(62, Math.min(99, Math.round(rawScore))),
   };
 }
@@ -1718,6 +1723,7 @@ function scorePlace(place, answers, maxWalk, delivery) {
   if (answers.decision === "explore") score += seededNumber(`${seed}-explore`) * 9;
   if (answers.risk === "oracle") score += seededNumber(`${seed}-oracle`) * 12;
   if (answers.mood === "random") score += seededNumber(`${seed}-random`) * 18;
+  score += Math.max(-4, Math.min(8, Number(place.quality) || 0));
 
   score += Math.max(0, 12 - place.distance / 250);
   if (!reason.length) reason.push("No es perfecto, pero el hambre aprobo la mocion.");
@@ -1749,10 +1755,12 @@ function wantsDelivery(answers) {
 }
 
 function makeMapsUrl(place, coords) {
-  if (Number.isFinite(place.lat) && Number.isFinite(place.lon)) {
-    return `https://www.google.com/maps/search/?api=1&query=${place.lat},${place.lon}`;
-  }
-  const query = encodeURIComponent(`${place.name} ${coords ? `cerca de ${coords.lat},${coords.lon}` : ""}`);
+  const fallbackNear = coords ? ` cerca de ${coords.lat.toFixed(6)},${coords.lon.toFixed(6)}` : "";
+  const queryText =
+    place.mapsQuery ||
+    [place.name, place.address, place.kind].filter(Boolean).join(", ") ||
+    (Number.isFinite(place.lat) && Number.isFinite(place.lon) ? `${place.lat},${place.lon}` : `local de comida${fallbackNear}`);
+  const query = encodeURIComponent(queryText);
   return `https://www.google.com/maps/search/?api=1&query=${query}`;
 }
 
