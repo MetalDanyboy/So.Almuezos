@@ -22,7 +22,14 @@ const UPSTASH_REDIS_REST_URL = String(process.env.UPSTASH_REDIS_REST_URL || "").
 const UPSTASH_REDIS_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
 const HAS_UPSTASH_QUOTA = Boolean(UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN);
 const HAS_PARTIAL_UPSTASH_QUOTA = Boolean(UPSTASH_REDIS_REST_URL || UPSTASH_REDIS_REST_TOKEN) && !HAS_UPSTASH_QUOTA;
-const GOOGLE_PLACE_TYPES = ["restaurant", "cafe", "bar", "meal_takeaway", "meal_delivery"];
+const GOOGLE_PLACE_TYPE_GROUPS = [
+  ["restaurant", "cafe", "bar", "bakery", "meal_takeaway", "meal_delivery"],
+  ["fast_food_restaurant", "hamburger_restaurant", "pizza_restaurant", "sandwich_shop", "breakfast_restaurant"],
+  ["sushi_restaurant", "japanese_restaurant", "chinese_restaurant", "thai_restaurant", "indian_restaurant", "korean_restaurant"],
+  ["mexican_restaurant", "italian_restaurant", "mediterranean_restaurant", "seafood_restaurant", "vegetarian_restaurant"],
+];
+const GOOGLE_PLACES_TYPE_GROUP_LIMIT = Math.max(1, Math.min(GOOGLE_PLACE_TYPE_GROUPS.length, positiveInteger(process.env.GOOGLE_PLACES_TYPE_GROUP_LIMIT, 3)));
+const GOOGLE_PLACES_MAX_RESULTS = Math.max(20, Math.min(80, positiveInteger(process.env.GOOGLE_PLACES_MAX_RESULTS, 60)));
 const GOOGLE_FIELD_MASK = [
   "places.id",
   "places.displayName",
@@ -563,32 +570,37 @@ async function fetchGooglePlaces(coords, radius) {
     throw new Error("Falta configurar GOOGLE_PLACES_API_KEY en variables de entorno");
   }
 
-  await ensureGooglePlacesQuotaAvailable();
-  await recordGooglePlacesUsage(1);
-  const data = await postJson(GOOGLE_PLACES_URL, {
-    includedTypes: GOOGLE_PLACE_TYPES,
-    maxResultCount: 20,
-    rankPreference: "DISTANCE",
-    languageCode: "es-419",
-    locationRestriction: {
-      circle: {
-        center: {
-          latitude: coords.lat,
-          longitude: coords.lon,
+  const responses = [];
+  const groups = GOOGLE_PLACE_TYPE_GROUPS.slice(0, GOOGLE_PLACES_TYPE_GROUP_LIMIT);
+  for (const types of groups) {
+    await consumeGooglePlacesQuota(1);
+    const data = await postJson(GOOGLE_PLACES_URL, {
+      includedTypes: types,
+      maxResultCount: 20,
+      rankPreference: "DISTANCE",
+      languageCode: "es-419",
+      locationRestriction: {
+        circle: {
+          center: {
+            latitude: coords.lat,
+            longitude: coords.lon,
+          },
+          radius,
         },
-        radius,
       },
-    },
-  }, {
-    "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
-    "X-Goog-FieldMask": GOOGLE_FIELD_MASK,
-  });
-  return (data.places || [])
+    }, {
+      "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+      "X-Goog-FieldMask": GOOGLE_FIELD_MASK,
+    });
+    responses.push(...(data.places || []));
+    if (responses.length >= GOOGLE_PLACES_MAX_RESULTS) break;
+  }
+  return responses
     .map((place) => normalizeGooglePlace(place, coords))
     .filter((place) => place.name && Number.isFinite(place.distance))
     .filter(uniquePlace())
     .sort((a, b) => placeSortScore(a) - placeSortScore(b))
-    .slice(0, 50);
+    .slice(0, GOOGLE_PLACES_MAX_RESULTS);
 }
 
 function normalizeGooglePlace(place, origin) {
@@ -653,6 +665,19 @@ async function ensureGooglePlacesQuotaAvailable() {
   }
 }
 
+async function consumeGooglePlacesQuota(amount) {
+  if (HAS_PARTIAL_UPSTASH_QUOTA) throw quotaStorageError(new Error("faltan variables UPSTASH_REDIS_REST_URL o UPSTASH_REDIS_REST_TOKEN"));
+  if (HAS_UPSTASH_QUOTA) {
+    const state = await recordGooglePlacesUsageInUpstash(amount);
+    if (state.used > GOOGLE_PLACES_MONTHLY_LIMIT) throw quotaLimitError(state);
+    return;
+  }
+  const state = readGooglePlacesUsageFromFile();
+  if (state.used >= GOOGLE_PLACES_MONTHLY_LIMIT) throw quotaLimitError(state);
+  state.used += amount;
+  writeGooglePlacesUsageToFile(state);
+}
+
 async function recordGooglePlacesUsage(amount) {
   if (HAS_PARTIAL_UPSTASH_QUOTA) throw quotaStorageError(new Error("faltan variables UPSTASH_REDIS_REST_URL o UPSTASH_REDIS_REST_TOKEN"));
   if (HAS_UPSTASH_QUOTA) {
@@ -664,9 +689,23 @@ async function recordGooglePlacesUsage(amount) {
   writeGooglePlacesUsageToFile(state);
 }
 
+function quotaLimitError(state) {
+  const quota = buildGooglePlacesQuota(state);
+  const error = new Error(
+    `Se pauso la busqueda con Google Places porque ya se usaron ${quota.used}/${quota.freeCap} consultas protegidas este mes. Vuelve a intentar en ${quota.resetsIn}.`,
+  );
+  error.quotaBlocked = true;
+  error.quota = quota;
+  return error;
+}
+
 async function googlePlacesQuota() {
   if (HAS_PARTIAL_UPSTASH_QUOTA) throw quotaStorageError(new Error("faltan variables UPSTASH_REDIS_REST_URL o UPSTASH_REDIS_REST_TOKEN"));
   const state = HAS_UPSTASH_QUOTA ? await readGooglePlacesUsageFromUpstash() : readGooglePlacesUsageFromFile();
+  return buildGooglePlacesQuota(state);
+}
+
+function buildGooglePlacesQuota(state) {
   return {
     provider: "google-places",
     storage: HAS_UPSTASH_QUOTA ? "upstash" : "local-file",
@@ -692,8 +731,9 @@ async function readGooglePlacesUsageFromUpstash() {
 
 async function recordGooglePlacesUsageInUpstash(amount) {
   try {
-    await upstashCommand(["INCRBY", googlePlacesUsageKey(), String(amount)]);
+    const used = Math.max(0, Math.floor(Number(await upstashCommand(["INCRBY", googlePlacesUsageKey(), String(amount)])) || 0));
     await upstashCommand(["EXPIREAT", googlePlacesUsageKey(), String(Math.floor(nextQuotaReset().getTime() / 1000))]);
+    return { month: currentQuotaMonth(), used };
   } catch (error) {
     throw quotaStorageError(error);
   }

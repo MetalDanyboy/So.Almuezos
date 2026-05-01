@@ -727,7 +727,7 @@ class LunchOracle extends HTMLElement {
   }
 
   placesPanel() {
-    const places = this.state.places.slice(0, 12);
+    const places = this.state.places.slice(0, 30);
     return `
       <section class="panel">
         <div class="panel-header"><h3>Locales detectados</h3></div>
@@ -744,13 +744,14 @@ class LunchOracle extends HTMLElement {
 
   placeItem(place) {
     const tags = badgesFor(place).slice(0, 3);
+    const mapsUrl = makeMapsUrl(place, this.state.coords);
     return `
-      <article class="place">
+      <a class="place" href="${escapeHtml(mapsUrl)}" target="_blank" rel="noreferrer" aria-label="Ver ubicacion de ${escapeHtml(place.name)}">
         <h4>${escapeHtml(place.name)}</h4>
         <div class="tiny">${escapeHtml(place.kind)} · ${formatDistance(place.distance)}</div>
         ${place.address ? `<div class="tiny">${escapeHtml(place.address)}</div>` : ""}
         <div class="tags">${tags.map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join("")}</div>
-      </article>
+      </a>
     `;
   }
 

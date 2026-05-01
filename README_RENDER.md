@@ -20,6 +20,8 @@ Para desarrollo local, copia `.env.example` a `.env` y completa:
 - `GOOGLE_PLACES_FREE_CAP`: tope gratis mensual que quieres proteger.
 - `GOOGLE_PLACES_SAFETY_BUFFER`: margen de seguridad antes del tope gratis.
 - `GOOGLE_PLACES_MONTHLY_LIMIT`: limite maximo de consultas que la app permitira en el mes.
+- `GOOGLE_PLACES_TYPE_GROUP_LIMIT`: cantidad de grupos de tipos de locales que consulta por busqueda. Por defecto `3`.
+- `GOOGLE_PLACES_MAX_RESULTS`: maximo de locales reales que la app conserva por busqueda. Por defecto `60`.
 - `UPSTASH_REDIS_REST_URL`: URL REST de tu base Redis en Upstash, recomendada para Render.
 - `UPSTASH_REDIS_REST_TOKEN`: token REST de Upstash.
 
@@ -28,6 +30,8 @@ En Render, define esas mismas variables en **Environment**. No pegues la clave e
 ## Proteccion de cuota Google Places
 
 Cada busqueda de locales consume una consulta protegida por el contador mensual de la app. Cuando llega a `GOOGLE_PLACES_MONTHLY_LIMIT`, el endpoint `/api/places` responde `429` y la interfaz bloquea la busqueda, indicando cuanto falta para el reinicio mensual.
+
+Para encontrar mas variedad, la app puede hacer varias consultas a Google Places por busqueda de usuario, cada una con un grupo distinto de tipos de comida. `GOOGLE_PLACES_TYPE_GROUP_LIMIT=3` significa hasta 3 consultas Google por busqueda de usuario, todas descontadas del mismo contador protegido.
 
 En produccion usa Upstash Redis para que el contador sobreviva reinicios y redeploys de Render. Si `UPSTASH_REDIS_REST_URL` y `UPSTASH_REDIS_REST_TOKEN` existen, la app guarda el uso en una clave mensual como `google_places_usage:2026-05` y le asigna expiracion automatica al inicio del mes siguiente. Si Upstash esta configurado pero no responde, la app bloquea la busqueda para evitar cobros accidentales.
 

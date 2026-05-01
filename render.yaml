@@ -17,6 +17,10 @@ services:
         value: 100
       - key: GOOGLE_PLACES_MONTHLY_LIMIT
         value: 4900
+      - key: GOOGLE_PLACES_TYPE_GROUP_LIMIT
+        value: 3
+      - key: GOOGLE_PLACES_MAX_RESULTS
+        value: 60
       - key: UPSTASH_REDIS_REST_URL
         sync: false
       - key: UPSTASH_REDIS_REST_TOKEN
