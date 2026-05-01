@@ -1774,6 +1774,7 @@ function makeMapsUrl(place, coords) {
     place.mapsQuery ||
     [place.name, place.address, place.kind].filter(Boolean).join(", ") ||
     (Number.isFinite(place.lat) && Number.isFinite(place.lon) ? `${place.lat},${place.lon}` : `local de comida${fallbackNear}`);
+  if (/^https?:\/\//i.test(queryText)) return queryText;
   const query = encodeURIComponent(queryText);
   return `https://www.google.com/maps/search/?api=1&query=${query}`;
 }
