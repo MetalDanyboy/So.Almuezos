@@ -674,23 +674,12 @@ async function ensureGooglePlacesQuotaAvailable() {
 async function consumeGooglePlacesQuota(amount) {
   if (HAS_PARTIAL_UPSTASH_QUOTA) throw quotaStorageError(new Error("faltan variables UPSTASH_REDIS_REST_URL o UPSTASH_REDIS_REST_TOKEN"));
   if (HAS_UPSTASH_QUOTA) {
-    const state = await recordGooglePlacesUsageInUpstash(amount);
-    if (state.used > GOOGLE_PLACES_MONTHLY_LIMIT) throw quotaLimitError(state);
+    const result = await consumeGooglePlacesQuotaInUpstash(amount);
+    if (!result.allowed) throw quotaLimitError(result.state);
     return;
   }
   const state = readGooglePlacesUsageFromFile();
-  if (state.used >= GOOGLE_PLACES_MONTHLY_LIMIT) throw quotaLimitError(state);
-  state.used += amount;
-  writeGooglePlacesUsageToFile(state);
-}
-
-async function recordGooglePlacesUsage(amount) {
-  if (HAS_PARTIAL_UPSTASH_QUOTA) throw quotaStorageError(new Error("faltan variables UPSTASH_REDIS_REST_URL o UPSTASH_REDIS_REST_TOKEN"));
-  if (HAS_UPSTASH_QUOTA) {
-    await recordGooglePlacesUsageInUpstash(amount);
-    return;
-  }
-  const state = readGooglePlacesUsageFromFile();
+  if (state.used >= GOOGLE_PLACES_MONTHLY_LIMIT || state.used + amount > GOOGLE_PLACES_MONTHLY_LIMIT) throw quotaLimitError(state);
   state.used += amount;
   writeGooglePlacesUsageToFile(state);
 }
@@ -735,11 +724,34 @@ async function readGooglePlacesUsageFromUpstash() {
   }
 }
 
-async function recordGooglePlacesUsageInUpstash(amount) {
+async function consumeGooglePlacesQuotaInUpstash(amount) {
   try {
-    const used = Math.max(0, Math.floor(Number(await upstashCommand(["INCRBY", googlePlacesUsageKey(), String(amount)])) || 0));
-    await upstashCommand(["EXPIREAT", googlePlacesUsageKey(), String(Math.floor(nextQuotaReset().getTime() / 1000))]);
-    return { month: currentQuotaMonth(), used };
+    const script = `
+      local current = tonumber(redis.call("GET", KEYS[1]) or "0")
+      local limit = tonumber(ARGV[1])
+      local amount = tonumber(ARGV[2])
+      local expires = tonumber(ARGV[3])
+      if current >= limit or current + amount > limit then
+        return {current, 0}
+      end
+      local next_value = redis.call("INCRBY", KEYS[1], amount)
+      redis.call("EXPIREAT", KEYS[1], expires)
+      return {next_value, 1}
+    `;
+    const result = await upstashCommand([
+      "EVAL",
+      script,
+      "1",
+      googlePlacesUsageKey(),
+      String(GOOGLE_PLACES_MONTHLY_LIMIT),
+      String(amount),
+      String(Math.floor(nextQuotaReset().getTime() / 1000)),
+    ]);
+    const used = Math.max(0, Math.floor(Number(result?.[0]) || 0));
+    return {
+      allowed: Number(result?.[1]) === 1,
+      state: { month: currentQuotaMonth(), used },
+    };
   } catch (error) {
     throw quotaStorageError(error);
   }
